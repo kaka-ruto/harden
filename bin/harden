@@ -298,7 +298,7 @@ cmd_update() {
   chmod +x "$tmp"
 
   local new_ver
-  new_ver=$(grep "^VERSION=" "$tmp" | cut -d= -f2 | tr -d '"')
+  new_ver=$(grep "^VERSION=" "$tmp" | head -1 | cut -d= -f2 | tr -d '"')
   if [ -z "$new_ver" ]; then
     rm -f "$tmp"
     die "Could not determine latest version"
