@@ -20,12 +20,17 @@ usage() {
 harden v$VERSION — One-command Linux server hardening
 
 Usage:
+  harden help                            Show this help
+  harden version                         Show version
+  harden update                          Update to latest version
   harden <user@host>                     Harden remote server
   harden --local                         Harden local machine
   harden <user@host> --check             Audit only, no changes
   harden <user@host> --allow-db-from IP  Allow specific IP on DB ports
 
 Examples:
+  harden help
+  harden update
   harden root@server
   harden root@server --allow-db-from 203.0.113.42
   harden root@server --check
@@ -178,7 +183,6 @@ fix_ssh() {
 fix_fail2ban() {
   apt install -y -qq fail2ban 2>/dev/null || true
   systemctl enable --now fail2ban 2>/dev/null || service fail2ban start 2>/dev/null || true
-  # Generate a default sshd jail config if one doesn't exist
   if [ -f /etc/fail2ban/jail.conf ] && [ ! -f /etc/fail2ban/jail.local ]; then
     cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local 2>/dev/null || true
   fi
@@ -278,6 +282,43 @@ FUNCTIONS
 )
 
 # ═══════════════════════════════════════════════
+# Update command
+# ═══════════════════════════════════════════════
+
+cmd_update() {
+  local url="https://raw.githubusercontent.com/kaka-ruto/harden/main/bin/harden"
+  local tmp="/tmp/harden-update-$$"
+
+  info "Checking for updates..."
+  if ! command -v curl &>/dev/null; then
+    die "curl is required for update"
+  fi
+
+  curl -sSL "$url" -o "$tmp" || die "Failed to download latest version"
+  chmod +x "$tmp"
+
+  local new_ver
+  new_ver=$(grep "^VERSION=" "$tmp" | cut -d= -f2 | tr -d '"')
+  if [ -z "$new_ver" ]; then
+    rm -f "$tmp"
+    die "Could not determine latest version"
+  fi
+
+  if [ "$new_ver" = "$VERSION" ]; then
+    ok "Already at latest version v$VERSION"
+    rm -f "$tmp"
+    exit 0
+  fi
+
+  local self
+  self="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+  cp "$tmp" "$self" || { rm -f "$tmp"; die "Failed to install update (permission denied)" ; }
+  rm -f "$tmp"
+
+  ok "Updated to v$new_ver"
+}
+
+# ═══════════════════════════════════════════════
 # Main local/remote dispatch
 # ═══════════════════════════════════════════════
 
@@ -290,6 +331,20 @@ run() {
 }
 
 # ── Parse args ──
+
+SUBCOMMANDS="help version update"
+FIRST="${1:-}"
+
+for cmd in $SUBCOMMANDS; do
+  if [ "$FIRST" = "$cmd" ]; then
+    case "$cmd" in
+      help) usage ;;
+      version) echo "harden v$VERSION"; exit 0 ;;
+      update) cmd_update ;;
+    esac
+    exit 0
+  fi
+done
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -307,7 +362,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[ -z "$SERVER" ] && { echo "Usage: harden <user@host>"; echo "       harden --local"; exit 1; }
+[ -z "$SERVER" ] && { echo "Usage: harden <user@host> [options]"; echo "       harden help"; exit 1; }
 
 if [ "$MODE" = "check" ]; then
   info "Check mode — no changes will be made"
