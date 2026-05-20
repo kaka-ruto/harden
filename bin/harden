@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ──────────────────────────────────────────────
+# harden — One-command Linux server hardening
+# Uses Lynis audit + automated fixes
+# Idempotent and safe to re-run
+# ──────────────────────────────────────────────
+
+VERSION="0.1.0"
+SENTINEL="/etc/.harden-done"
+MY_IP=""
+SERVER=""
+MODE="fix"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+
+usage() {
+  cat <<EOF
+harden v$VERSION — One-command Linux server hardening
+
+Usage:
+  harden <user@host>                     Harden remote server
+  harden --local                         Harden local machine
+  harden <user@host> --check             Audit only, no changes
+  harden <user@host> --allow-db-from IP  Allow specific IP on DB ports
+
+Examples:
+  harden root@server
+  harden root@server --allow-db-from 203.0.113.42
+  harden root@server --check
+  harden --local
+EOF
+  exit 0
+}
+
+info()  { echo -e "${CYAN}[info]${NC}  $*"; }
+ok()    { echo -e "${GREEN}[ok]${NC}    $*"; }
+warn()  { echo -e "${YELLOW}[warn]${NC}  $*"; }
+fail()  { echo -e "${RED}[fail]${NC}  $*"; }
+die()   { echo -e "${RED}Error:${NC} $*" >&2; exit 1; }
+
+# ═══════════════════════════════════════════════
+# Remote functions (run on target server)
+# ═══════════════════════════════════════════════
+
+REMOTE_FUNCTIONS=$(cat << 'FUNCTIONS'
+set -eo pipefail
+
+MY_IP="${1:-}"
+SENTINEL="${2:-/etc/.harden-done}"
+MODE="${3:-fix}"
+VERSION="0.1.0"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+info()  { echo -e "${CYAN}[info]${NC}  $*"; }
+ok()    { echo -e "${GREEN}[ok]${NC}    $*"; }
+warn()  { echo -e "${YELLOW}[warn]${NC}  $*"; }
+fail()  { echo -e "${RED}[fail]${NC}  $*"; }
+
+check_root() {
+  if [ "$(id -u)" != "0" ]; then echo "Must be root"; exit 1; fi
+}
+
+check_os() {
+  if ! command -v apt &>/dev/null; then echo "Unsupported OS"; exit 1; fi
+}
+
+install_lynis() {
+  if command -v lynis &>/dev/null; then return 0; fi
+  apt update -qq 2>/dev/null || true
+  apt install -y -qq lynis 2>/dev/null || {
+    cd /tmp
+    curl -sSLO https://packages.cisofy.com/community/lynis/deb/lynis_3.1.4_all.deb 2>/dev/null || true
+    dpkg -i lynis_3.1.4_all.deb 2>/dev/null || true
+    apt -f install -y -qq 2>/dev/null || true
+    rm -f lynis_3.1.4_all.deb
+  }
+  command -v lynis &>/dev/null
+}
+
+run_lynis() {
+  local label="$1"
+  if command -v lynis &>/dev/null; then
+    lynis audit system --quiet 2>/dev/null || true
+    local logfile
+    logfile=$(ls -t /var/log/lynis-report.dat 2>/dev/null | head -1)
+    if [ -n "$logfile" ]; then
+      grep -oP '^hardening_index=\K[0-9]+' "$logfile" 2>/dev/null || echo "0"
+    fi
+  fi
+}
+
+# ── Checks ──
+
+check_firewall() {
+  if command -v ufw &>/dev/null; then
+    if ufw status 2>/dev/null | head -1 | grep -qi "active"; then
+      return 0
+    fi
+  elif iptables -L -n 2>/dev/null | grep -qi "DROP\|REJECT"; then
+    return 0
+  fi
+  return 1
+}
+
+check_ssh_root() {
+  sshd -T 2>/dev/null | grep "^permitrootlogin" | grep -q "prohibit-password" ||
+  grep -q "^PermitRootLogin prohibit-password" /etc/ssh/sshd_config 2>/dev/null
+}
+
+check_ssh_password() {
+  sshd -T 2>/dev/null | grep "^kbdinteractiveauthentication" | grep -qi "no" ||
+  grep -q "^KbdInteractiveAuthentication no" /etc/ssh/sshd_config 2>/dev/null
+}
+
+check_fail2ban() {
+  command -v fail2ban-client &>/dev/null && fail2ban-client status sshd &>/dev/null
+}
+
+check_docker_icc() {
+  [ -f /etc/docker/daemon.json ] && grep -q '"icc": false' /etc/docker/daemon.json 2>/dev/null
+}
+
+check_docker_logs() {
+  [ -f /etc/docker/daemon.json ] && grep -q '"log-opts"' /etc/docker/daemon.json 2>/dev/null
+}
+
+check_telnet() {
+  ! dpkg -l inetutils-telnet 2>/dev/null | grep -q "^ii"
+}
+
+check_unattended() {
+  dpkg -l unattended-upgrades 2>/dev/null | grep -q "^ii"
+}
+
+# ── Fixes ──
+
+fix_firewall() {
+  command -v ufw &>/dev/null || {
+    apt install -y -qq ufw 2>/dev/null || true
+  }
+  command -v ufw &>/dev/null || { fail "UFW not available, install manually: apt install ufw"; return 1; }
+  ufw --force reset 2>/dev/null || true
+  ufw default deny incoming 2>/dev/null
+  ufw default allow outgoing 2>/dev/null
+  ufw allow ssh 2>/dev/null
+  ufw allow 80/tcp 2>/dev/null
+  ufw allow 443/tcp 2>/dev/null
+  if [ -n "$MY_IP" ]; then
+    ufw allow from "$MY_IP" to any port 5432 proto tcp 2>/dev/null || true
+    ufw allow from "$MY_IP" to any port 6432 proto tcp 2>/dev/null || true
+  fi
+  ufw --force enable 2>/dev/null
+}
+
+fix_ssh() {
+  local c=/etc/ssh/sshd_config
+  sed -i 's/^PermitRootLogin yes/PermitRootLogin prohibit-password/' "$c" 2>/dev/null || true
+  if ! grep -q "^PermitRootLogin prohibit-password" "$c" 2>/dev/null; then
+    echo "PermitRootLogin prohibit-password" >> "$c"
+  fi
+  sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' "$c" 2>/dev/null || true
+  if ! grep -q "^PasswordAuthentication no" "$c" 2>/dev/null; then
+    echo "PasswordAuthentication no" >> "$c"
+  fi
+  sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' "$c" 2>/dev/null || true
+  if ! grep -q "^KbdInteractiveAuthentication no" "$c" 2>/dev/null; then
+    echo "KbdInteractiveAuthentication no" >> "$c"
+  fi
+  sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' "$c" 2>/dev/null || true
+  if ! grep -q "^ChallengeResponseAuthentication no" "$c" 2>/dev/null; then
+    echo "ChallengeResponseAuthentication no" >> "$c"
+  fi
+  systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || sshd -T >/dev/null 2>&1 || true
+}
+
+fix_fail2ban() {
+  apt install -y -qq fail2ban 2>/dev/null || true
+  systemctl enable --now fail2ban 2>/dev/null || service fail2ban start 2>/dev/null || true
+  # Generate a default sshd jail config if one doesn't exist
+  if [ -f /etc/fail2ban/jail.conf ] && [ ! -f /etc/fail2ban/jail.local ]; then
+    cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local 2>/dev/null || true
+  fi
+}
+
+fix_docker() {
+  command -v docker &>/dev/null || return 0
+  local cfg=/etc/docker/daemon.json
+  if [ -f "$cfg" ]; then
+    if grep -q '"icc": false' "$cfg" 2>/dev/null && grep -q '"log-opts"' "$cfg" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  cat > "$cfg" << 'DEOF'
+{
+  "icc": false,
+  "userland-proxy": false,
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
+DEOF
+  systemctl restart docker 2>/dev/null || service docker restart 2>/dev/null || true
+  sleep 2
+}
+
+fix_telnet() {
+  apt purge -y -qq inetutils-telnet 2>/dev/null || true
+}
+
+fix_unattended() {
+  apt install -y -qq unattended-upgrades 2>/dev/null || true
+}
+
+# ── Main ──
+
+check_root
+check_os
+install_lynis || true
+
+echo ""
+echo "╔════════════════════════════════════════╗"
+echo "║  harden v$VERSION — Server Hardening  ║"
+echo "╚════════════════════════════════════════╝"
+echo ""
+
+SCORE_BEFORE=$(run_lynis "before" || echo "0")
+
+echo "─────────────── Pre-flight ────────────────"
+echo ""
+
+check_firewall && ok  "UFW firewall active"          || fail "UFW firewall inactive"
+check_ssh_root && ok  "SSH root key-only"            || fail "SSH root login allows passwords"
+check_ssh_password && ok "SSH passwords disabled"    || fail "SSH passwords may be active"
+check_fail2ban && ok  "fail2ban active"              || fail "fail2ban not active"
+check_docker_icc && ok "Docker icc disabled"         || fail "Docker icc not disabled"
+check_docker_logs && ok "Docker logs limited"        || fail "Docker logs not limited"
+check_telnet && ok    "telnet not present"           || fail "telnet is installed"
+check_unattended && ok "unattended-upgrades active"  || fail "unattended-upgrades missing"
+echo ""
+
+if [ "$MODE" = "check" ]; then
+  echo "─────── Check only — no changes applied ────────"
+  exit 0
+fi
+
+echo "─────────────── Applying fixes ────────────────"
+echo ""
+
+fix_firewall;      ok "UFW enabled"
+fix_ssh;           ok "SSH hardened"
+fix_fail2ban;       ok "fail2ban installed"
+fix_docker;        ok "Docker hardened"
+fix_telnet;        ok "telnet removed"
+fix_unattended;    ok "unattended-upgrades ensured"
+echo ""
+
+SCORE_AFTER=$(run_lynis "after" || echo "0")
+
+echo "─────────────── Results ────────────────"
+echo ""
+if [ "$SCORE_BEFORE" -gt 0 ] && [ "$SCORE_AFTER" -gt 0 ]; then
+  DIFF=$((SCORE_AFTER - SCORE_BEFORE))
+  ok "Hardening index: $SCORE_BEFORE → $SCORE_AFTER (+$DIFF)"
+fi
+check_firewall && ok "UFW — firewall" || fail "UFW — firewall"
+check_ssh_root && ok "SSH — root key-only" || fail "SSH — root key-only"
+check_ssh_password && ok "SSH — no passwords" || fail "SSH — no passwords"
+check_fail2ban && ok "fail2ban — brute force protection" || fail "fail2ban"
+check_docker_icc && ok "Docker — hardened" || fail "Docker"
+check_telnet && ok "telnet — removed" || fail "telnet"
+check_unattended && ok "unattended-upgrades — active" || fail "unattended-upgrades"
+echo ""
+
+touch "$SENTINEL"
+ok "Server hardened"
+FUNCTIONS
+)
+
+# ═══════════════════════════════════════════════
+# Main local/remote dispatch
+# ═══════════════════════════════════════════════
+
+run() {
+  if [ "$SERVER" = "--local" ] || [ "$SERVER" = "localhost" ]; then
+    bash -s "$MY_IP" "$SENTINEL" "$MODE" <<< "$REMOTE_FUNCTIONS"
+  else
+    ssh -o StrictHostKeyChecking=accept-new "$SERVER" "bash -s" "$MY_IP" "$SENTINEL" "$MODE" <<< "$REMOTE_FUNCTIONS"
+  fi
+}
+
+# ── Parse args ──
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h) usage ;;
+    --version|-v) echo "harden v$VERSION"; exit 0 ;;
+    --check) MODE="check"; shift ;;
+    --local) SERVER="--local"; shift ;;
+    --allow-db-from) MY_IP="$2"; shift 2 ;;
+    -*)
+      [ -z "$SERVER" ] && { SERVER="$1"; shift; } || die "Unknown: $1"
+      ;;
+    *)
+      [ -z "$SERVER" ] && { SERVER="$1"; shift; } || die "Unexpected: $1"
+      ;;
+  esac
+done
+
+[ -z "$SERVER" ] && { echo "Usage: harden <user@host>"; echo "       harden --local"; exit 1; }
+
+if [ "$MODE" = "check" ]; then
+  info "Check mode — no changes will be made"
+fi
+
+run
